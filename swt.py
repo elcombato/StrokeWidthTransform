@@ -1,51 +1,80 @@
-# -*- encoding: utf-8 -*-
-from __future__ import division
 import math
 import numpy as np
 import cv2
+import os
+from time import time
 from scipy.spatial import KDTree
 
-img_write = True
 
-
-def scrub(filepath):
+def scrub(filepath, verbose=0):
     """
     Apply Stroke-Width Transform to image.
 
     :param filepath: relative or absolute filepath to source image
     :return: numpy array representing result of transform
     """
-    canny, sobelx, sobely, theta = _create_derivative(filepath)
-    swt = _swt(theta, canny, sobelx, sobely)
+    # find components with SWT
+    img_gray = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+    canny, sobelx, sobely, theta = _create_derivative(img_gray, verbose)
+    swt = _swt(theta, canny, sobelx, sobely, verbose)
     comp = _connect_components(swt)
-    swts, heights, widths, topleft_pts, images = _find_letters(swt, comp)
-    word_images = _find_words(swts, heights, widths, topleft_pts, images)
 
-    final_mask = np.zeros(swt.shape)
-    for word in word_images:
-        final_mask += word
-    return final_mask
+    # find letter-candidates and words
+    letter, letter_imgs = _find_letters(swt, comp)
+    words = _find_words(letter)
+
+    # create bounding boxes around letter-candidates and words
+    letter_pts = _bounding_box(letter_data=letter)
+    words_pts = _bounding_box(letter_data=letter, word_lists=words)
+
+    # draw bounding boxes on image and return image
+    img_rgb = cv2.imread(filepath, cv2.IMREAD_COLOR)
+    for i, [pt1y, pt1x, pt2y, pt2x] in enumerate(letter_pts):
+        cv2.rectangle(img_rgb, (pt1x, pt1y), (pt2x, pt2y), (0, 0, 255), 1)
+        cv2.putText(img_rgb, str(i), (pt1x, pt1y-2), cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 0, 255))
+    for i, [pt1y, pt1x, pt2y, pt2x] in enumerate(words_pts):
+        cv2.rectangle(img_rgb, (pt1x, pt1y), (pt2x, pt2y), (255, 0, 0), 2)
+
+    return img_rgb
 
 
-def _create_derivative(filepath):
-    img = cv2.imread(filepath, 0)
-    edges = cv2.Canny(img, 175, 320, apertureSize=3)
+def _bounding_box(letter_data, word_lists=None):
+
+    # north-west point [pt1]
+    pt1 = letter_data[:, 3:5].astype(int)
+
+    # south-east point [pt2] = (north + height, west + width)
+    pt2_y = letter_data[:, 3] + letter_data[:, 1]
+    pt2_x = letter_data[:, 4] + letter_data[:, 2]
+    pt2 = np.vstack([pt2_y, pt2_x]).T.astype(int)
+
+    if word_lists is None:
+        return np.column_stack([pt1, pt2])
+
+    return np.array([[pt1[list(w)][:, 0].min(),
+                      pt1[list(w)][:, 1].min(),
+                      pt2[list(w)][:, 0].max(),
+                      pt2[list(w)][:, 1].max()] for w in word_lists])
+
+
+def _create_derivative(img, verbose=0):
+    edges = cv2.Canny(img, 250, 400, apertureSize=3) # 175, 320
     # Create gradient map using Sobel
     sobelx64f = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=-1)
     sobely64f = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=-1)
 
     theta = np.arctan2(sobely64f, sobelx64f)
-    if img_write:
-        cv2.imwrite('edges.jpg', edges)
-        cv2.imwrite('sobelx64f.jpg', np.absolute(sobelx64f))
-        cv2.imwrite('sobely64f.jpg', np.absolute(sobely64f))
+    if verbose > 0:
+        cv2.imwrite('../_data/edges.jpg', edges)
+        cv2.imwrite('../_data/sobelx64f.jpg', np.absolute(sobelx64f))
+        cv2.imwrite('../_data/sobely64f.jpg', np.absolute(sobely64f))
         # amplify theta for visual inspection
         theta_visible = (theta + np.pi)*255/(2*np.pi)
-        cv2.imwrite('theta.jpg', theta_visible)
+        cv2.imwrite('../_data/theta.jpg', theta_visible)
     return edges, sobelx64f, sobely64f, theta
 
 
-def _swt(theta, edges, sobelx64f, sobely64f):
+def _swt(theta, edges, sobelx64f, sobely64f, verbose=0):
 
     max_ray_len = 100
     max_angl_diff = math.pi / 2
@@ -109,17 +138,14 @@ def _swt(theta, edges, sobelx64f, sobely64f):
                         prev_x = q_x
                         prev_y = q_y
 
-    if img_write:
-        cv2.imwrite('swt_.jpg', swt * 100)
-
     # Compute median SWT
     for ray in rays:
         median = np.median(swt[ray[:, 1], ray[:, 0]])
         for (p_x, p_y) in ray:
             swt[p_y, p_x] = min(median, swt[p_y, p_x])
 
-    if img_write:
-        cv2.imwrite('swt.jpg', swt * 100)
+    if verbose > 0:
+        cv2.imwrite('../_data/swt.jpg', swt * 100)
 
     return swt
 
@@ -248,116 +274,116 @@ def _connect_components(swt):
 def _find_letters(swt, comp):
     img_w = swt.shape[0]
     img_h = swt.shape[1]
-    # STEP: Discard shapes that are probably not letters
-    swts = []
-    heights = []
-    widths = []
-    topleft_pts = []
-    images = []
+    letter_infs = []
+    letter_imgs = []
 
     for _, c in comp.items():
         east, west, south, north = max(c['x']), min(c['x']), max(c['y']), min(c['y'])
         width, height = east - west, south - north
 
-        if width < 8 or height < 8:
+        if width < 8 and height < 8:
             continue
-
+        if width < 4 or height < 4:
+            continue
         if width / height > 10 or height / width > 10:
             continue
 
         diameter = math.sqrt(width**2 + height**2)
         median_swt = np.median(swt[(c['y'], c['x'])])
-        if diameter / median_swt > 10:
+        if diameter / median_swt > 15:  # TODO: this threshold can be improved?
             continue
 
         if width / img_w > 0.4 or height / img_h > 0.4:
             continue
 
-        # we use log_base_2 so we can do linear distance comparison later using k-d tree
-        # ie, if log2(x) - log2(y) > 1, we know that x > 2*y
-        # Assumption: we've eliminated anything with median_swt == 1
-        swts.append([math.log(median_swt, 2)])
-        heights.append([math.log(height, 2)])
-        topleft_pts.append(np.asarray([north, west]))
-        widths.append(width)
-        fulllayer = np.zeros((img_w, img_h), dtype=np.uint16)
+        letter_img = np.zeros((img_w, img_h))
         for i in range(len(c['y'])):
-            fulllayer[c['y'][i], c['x'][i]] = 1
-        images.append(fulllayer)
+            letter_img[c['y'][i], c['x'][i]] = 1
+        letter_inf = [
+            median_swt,
+            height,
+            width,
+            north,
+            west
+        ]
+        letter_infs.append(letter_inf)
+        letter_imgs.append(letter_img)
 
-    return swts, heights, widths, topleft_pts, images
+    return np.asarray(letter_infs), np.asarray(letter_imgs)
 
 
-def _find_words(swts, heights, widths, topleft_pts, images):
-    # Find all shape pairs that have similar median stroke widths
-    swt_tree = KDTree(np.asarray(swts))
-    stp = swt_tree.query_pairs(1)
+def _find_words(letr_inf): # swts, heights, widths, topleft_pts, images):
+    # Index-pairs of letter with similar median stroke widths and similar heights
+    # We use log2 for linear distance comparison in KDTree
+    # (i.e. if log2(x) - log2(y) > 1, we know that x > 2*y)
+    s_ix_letr_pairs = KDTree(np.log2(letr_inf[:, 0:1])).query_pairs(1)
+    h_ix_letr_pairs = KDTree(np.log2(letr_inf[:, 1:2])).query_pairs(1)
 
-    # Find all shape pairs that have similar heights
-    height_tree = KDTree(np.asarray(heights))
-    htp = height_tree.query_pairs(1)
+    # Calc the angle (direction of text) for all letter-pairs which are
+    # similar and close to each other
+    pairs = []
+    for ix_letr1, ix_letr2 in h_ix_letr_pairs.intersection(s_ix_letr_pairs):
+        diff = letr_inf[ix_letr1, 3:5] - letr_inf[ix_letr2, 3:5]
+        # Distance between letters smaller than
+        # 3 times the width of the wider letter
+        dist = np.linalg.norm(diff)
+        if dist < max(letr_inf[ix_letr1, 2], letr_inf[ix_letr2, 2]) * 3:
+            angle = math.atan2(diff[0], diff[1])
+            angle += math.pi if angle < 0 else 0
+            pairs.append([ix_letr1, ix_letr2, angle])
+    pairs = np.asarray(pairs)
 
-    # Intersection of valid pairings
-    isect = htp.intersection(stp)
+    # Pairs of letter-pairs with a similar angle (direction of text)
+    a_ix_pair_pairs = KDTree(pairs[:, 2:3]).query_pairs(math.pi / 12)
 
     chains = []
-    pairs = []
-    pair_angles = []
-    for pair in isect:
-        left = pair[0]
-        right = pair[1]
-        widest = max(widths[left], widths[right])
-        distance = np.linalg.norm(topleft_pts[left] - topleft_pts[right])
-        if distance < widest * 3:
-            delta_yx = topleft_pts[left] - topleft_pts[right]
-            angle = np.arctan2(delta_yx[0], delta_yx[1])
-            if angle < 0:
-                angle += math.pi
+    for ix_pair_a, ix_pair_b in a_ix_pair_pairs:
+        # Letter pairs [a] & [b] have a similar angle and each pair consists of
+        # letter [1] & [2] which meet the similarity-requirements.
+        pair_a_letr1, pair_a_letr2 = int(pairs[ix_pair_a, 0]), int(pairs[ix_pair_a, 1])
+        pair_b_letr1, pair_b_letr2 = int(pairs[ix_pair_b, 0]), int(pairs[ix_pair_b, 1])
 
-            pairs.append(pair)
-            pair_angles.append(np.asarray([angle]))
-
-    angle_tree = KDTree(np.asarray(pair_angles))
-    atp = angle_tree.query_pairs(np.pi/12)
-
-    for pair_idx in atp:
-        pair_a = pairs[pair_idx[0]]
-        pair_b = pairs[pair_idx[1]]
-        left_a = pair_a[0]
-        right_a = pair_a[1]
-        left_b = pair_b[0]
-        right_b = pair_b[1]
-
-        # @todo - this is O(n^2) or similar, extremely naive. Use a search tree.
+        # TODO: not correct?
         added = False
-        for chain in chains:
-            if left_a in chain:
-                chain.add(right_a)
+        for c in chains:
+            if pair_a_letr1 in c:
+                c.add(pair_a_letr2)
                 added = True
-            elif right_a in chain:
-                chain.add(left_a)
+            elif pair_a_letr2 in c:
+                c.add(pair_a_letr1)
                 added = True
         if not added:
-            chains.append(set([left_a, right_a]))
+            chains.append({pair_a_letr1, pair_a_letr2})
         added = False
-        for chain in chains:
-            if left_b in chain:
-                chain.add(right_b)
+        for c in chains:
+            if pair_b_letr1 in c:
+                c.add(pair_b_letr2)
                 added = True
-            elif right_b in chain:
-                chain.add(left_b)
+            elif pair_b_letr2 in c:
+                c.add(pair_b_letr1)
                 added = True
         if not added:
-            chains.append(set([left_b, right_b]))
+            chains.append({pair_b_letr1, pair_b_letr2})
+    chains = np.asarray(chains)
 
-    word_images = []
-    for chain in [c for c in chains if len(c) > 3]:
-        for idx in chain:
-            word_images.append(images[idx])
+    # List of sets of letters with possibly many duplicates
+    # return chains
+    # Single list of unique letters
+    # return np.unique([int(ix) for chain in chains if len(chain) >= 3 for ix in chain])
 
-    return word_images
+    vecfunc = np.vectorize(len)
+    chains = chains[vecfunc(chains) > 3]
+    _, uniq_ix = np.unique(chains.astype(str), return_index=True)
+    return chains[uniq_ix]
 
 
 if __name__ == '__main__':
-    final_mask = scrub("test.jpg")
-    cv2.imwrite('final.jpg', final_mask * 255)
+
+    for img_f in os.scandir("../_data/stills/"):
+        if img_f.name.endswith('.PNG'):
+            print(f'start analysis for {img_f.name} ..')
+            tick = time()
+            result_img = scrub(img_f.path)
+            print(f'.. finished ({time()-tick:.2f}s)')
+            cv2.imwrite(f"../_data/out/{img_f.name}", result_img)
+    print('DONE')
