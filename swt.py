@@ -90,6 +90,9 @@ class SWTScrubber(object):
 
                         if cur_x != prev_x or cur_y != prev_y:
                             # we have moved to the next pixel!
+                            if cur_x < 0 or cur_y < 0:
+                                # out of image boundary
+                                break
                             try:
                                 if edges[cur_y, cur_x] > 0:
                                     # found edge,
